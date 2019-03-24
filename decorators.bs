@@ -1,0 +1,230 @@
+<pre class='metadata'>
+Title: Decorators and the define_function operator
+Group: WG21
+Status: D
+Editor: Rubén Pérez <rubenperez038@gmail.com>
+Shortname: PXXXX
+Abstract: This document proposes decorators as a succint syntax for calling higher order functions. The proposal also introduces the define_function operator as a way to allow the generation of regular functions and member functions from constexpr callable objects.
+Date: 2019-03-24
+Markup Shorthands: markdown yes
+Revision: 0
+ED: https://github.com/anarthal/cpp-decorators.git
+</pre>
+
+<style>
+.ins, ins, ins *, span.ins, span.ins * {
+  background-color: rgb(200, 250, 200);
+  color: rgb(0, 136, 0);
+  text-decoration: none;
+}
+
+.del, del, del *, span.del, span.del * {
+  background-color: rgb(250, 200, 200);
+  color: rgb(255, 0, 0);
+  text-decoration: line-through;
+  text-decoration-color: rgb(255, 0, 0);
+}
+</style>
+
+Revision History {#history}
+================
+Initial draft.
+
+
+Introduction {#intro}
+==========
+Decorators are a succint syntax to express calls to higher order functions. They are extensively employed in other languages, like Python. There are many possible use cases: from adding log statements to existing functions, to defining unit test cases.
+
+The proposed syntax follows an approach based on constexpr callable objects. However, callable objects cannot participate in overload resolution with other regular functions, nor can be used as regular member functions. This paper proposes operator define_function to achieve this purpose:
+- Generate a regular function, from a constexpr callable object.
+- Generate a member function, from a constexpr callable object. 
+
+Decorators {#decorators}
+==========
+Decorators are regular constexpr functions that takes a callable as only argument and that returns another callable. In short words, decorators are constexpr higher-order functions. Decorators can be applied to standalone functions and to member functions. When a decorator is applied to a given function, the decorator is called. The callable returned from the decorator is used to define a new function/member function that completely replaces the decorator function. The semantics of the define_function operator are employed to define this new function.
+
+<h3 id="funs">Regular functions</h3>
+
+As an example, say we want to add some logging to an existing function. We can define the add_logging decorator like this (legal in C++14):
+
+```cpp
+template <typename Callable>
+constexpr auto add_logging(Callable&& cb)
+{
+  return [cb](auto&&... params) {
+    std::cout << "Before the function\n";
+    cb(std::forward<decltype(params)>(params)...);
+    std::cout << "After the function\n";
+  };
+}
+```
+
+We apply the decorator using the (new) apply-decorator operator, `??`:
+
+```cpp
+??add_logging
+void my_function()
+{
+   std::cout << "Inside the decorated function\n";
+}
+```
+
+This will be transformed roughly into:
+
+```cpp
+
+// Note: the original function is replaced by the output of the decorator.
+void __my_function()
+{
+   std::cout << "Inside the decorated function\n";
+}
+
+constexpr auto __closure = add_logging(__my_function);
+
+// Function signature deduced from __closure operator() signature(s).
+// See the define_function operator.
+template<typename... Args>
+void my_function(Args&&... args)
+{
+    __closure(std::forward<Args>(args)...);
+}
+
+// The definition above is equivalent to:
+//   define_function(my_function, __closure);
+
+```
+
+In the above example, we have:
+- add_logging is used as a **decorator**.
+- my_function is the **decorated function**.
+- The function defined as a result of applying the decorator is the **result function**.
+
+<h3 id="mem_funs">Member functions</h3>
+
+Decoratos can also be applied to member functions. In this case, the decorator will be passed a pointer to the decorated member function. The function object returned from the decorator will be transformed into a member function (see [[#define_function_mem]]).
+
+Example:
+
+```cpp
+template <typename T, typename R, typename... MemArgs>
+constexpr auto add_logging(R (T::*pfn)(MemArgs...) const)
+{
+  return [pfn](const T& obj, MemArgs&&... args) {
+    std::cout << "Object name: " << obj.get_name() << endl;
+    (obj.*pfn)(std::forward<decltype(args)>(args)...);
+  };
+}
+
+class MyClass
+{
+public:
+    std::string_view get_name() const { return "A name"; }
+
+    ??add_name_logging
+    void my_function(std::string s0) const
+    {
+        std::cout << "Member function: " << s0 << std::endl;
+    }
+};
+```
+
+Will be transformed in something roughly equivalent to:
+
+```cpp
+
+class MyClass
+{
+public:
+    std::string_view get_name() const { return "A name"; }
+    void __my_function(std::string s0) const
+    {
+        std::cout << "Member function: " << s0 << std::endl;
+    }
+
+    template<typename... Args>
+    void my_function(Args&&... args) const;
+};
+
+constexpr auto __closure = add_logging(&MyClass::__my_function);
+
+template<typename... Args>
+inline void MyClass::my_function(Args&&... args) const
+{
+  __closure(*this, std::forward<Args>(args)...);
+}
+
+```
+
+The define_function operator {#define_function}
+==========
+The define_function operator provides a bridge between function objects and regular and member functions. It may be useful for decorators and any form of constexpr metaprogramming.
+
+<h3 id="define_function_funs">Regular functions</h3>
+
+define_function can be employed whenever a function definition can:
+
+```cpp
+namespace mylib
+{
+  define_function(my_function, callable_expression);
+}
+```
+
+Is roughly equivalent to:
+
+```cpp
+namespace mylib
+{
+  constexpr auto __closure = callable_expression;
+  // More than one of these definitions may be generated
+  inline /* deduced return type */
+  my_function(/* deduced argument types */)
+  {
+    return __closure(/* Forwarded arguments */);
+  }
+}
+```
+
+Where `callable_expression` is a constexpr expression whose type is a callable object. This will define one or more regular functions whose body is a call to the resulting object's operator(), with the arguments forwarded. The defined functions will be inline. The number of functions to be delcared and their signature is deduced from the object's operator() signature:
+
+- For each overload of operator(), a function overload with the same parameters and return type will be generated.
+- If any of the overloads is a template function, the generated function will also be a template with the same template parameters, arguments and return type.
+- The defined functions will have no implied object argument. If any of the operator() overloads is only distinguishable by the member function CV-qualifications or ref-qualifications, the program is ill-formed.
+
+<h3 id="define_function_mem">Member functions</h3>
+define_function can also be used within a class definition, in which case it will define a member function. For example:
+
+```cpp
+class MyClass
+{
+public:
+  define_function(my_function, callable_expression);
+}
+```
+
+Is roughly equivalent to:
+
+```cpp
+class MyClass
+{
+  static constexpr auto __closure = callable_expression;
+public:
+  /* deduced return type */
+  my_function(/* deduced argument types */) /* Deduced CV/ref qualifiers*/
+  {
+    return __closure(*this, /* Forwarded arguments */);
+  }
+}
+```
+
+As for standalone functions, a single define_function may produce several function definitions. The function object's operator() must have at least one parameter of one of the following exact types:
+- MyClass&
+- const MyClass&
+- MyClass&&
+
+The member function will have as many parameters as the object's operator() minus one. The member function CV and ref qualifications will be deduced from the function object's operator() first parameter type.
+
+Acknowledgements {#ack}
+================
+
+I would like to acknowledge Gašper Ažman for his valuable help.
